@@ -11,42 +11,68 @@ class MockTwoCameras:
         self.width, self.height = resolution
         self.num_cameras = 2
         
-        # Create asymmetric 3D-like pattern
-        self.pattern_points = np.array([
-            [150, 100],   # Top left region
-            [200, 120],
-            [180, 150],
-            [350, 150],   # Top right region
-            [400, 180],
-            [380, 200],
-            [150, 300],   # Bottom left region
-            [200, 350],
-            [450, 250],   # Bottom right region
-            [500, 300],
-
-
+        # Create 3D points in world coordinates - adjusted to be more visible
+        self.world_points = np.array([
+            [-1, -1, 8],    # Front top left
+            [1, -1, 8],     # Front top right
+            [-1, 1, 8],     # Front bottom left
+            [1, 1, 8],      # Front bottom right
+            [-0.5, -0.5, 10],    # Back top left
+            [0.5, -0.5, 10],     # Back top right
+            [-0.5, 0.5, 10],     # Back bottom left
+            [0.5, 0.5, 10],      # Back bottom right
+            [0, 0, 9],      # Center point
+            [-0.75, 0, 9]    # Extra point for asymmetry
         ], dtype=np.float32)
-        
-        # Define transformation for second camera view
-        angle = np.radians(20)
-        self.view2_matrix = np.array([
-            [np.cos(angle), 0, -10],
-            [0, 1, 0],
+
+        # Camera 1 parameters (at origin, looking along Z axis)
+        self.K = np.array([
+            [self.width/2, 0, self.width/2],
+            [0, self.height/2, self.height/2],
             [0, 0, 1]
         ], dtype=np.float32)
+        
+        self.R1 = np.eye(3)
+        self.t1 = np.zeros((3, 1))
+        
+        # Camera 2 parameters (rotated and translated)
+        angle = np.radians(30)  # 55-degree rotation around Y axis
+        self.R2 = np.array([
+            [np.cos(angle), 0, -np.sin(angle)],
+            [0, 1, 0],
+            [np.sin(angle), 0, np.cos(angle)]
+        ], dtype=np.float32)
+        
+        self.t2 = np.array([-1, 0, 0], dtype=np.float32).reshape(3, 1)  # Reduced translation
+
+    def project_points(self, points_3d, R, t):
+        """Project 3D points onto camera image plane."""
+        # Convert to homogeneous coordinates
+        points_3d_homog = np.hstack((points_3d, np.ones((len(points_3d), 1))))
+        
+        # Create projection matrix
+        P = self.K @ np.hstack((R, t))
+        
+        # Project points
+        points_proj = points_3d_homog @ P.T
+        
+        # Convert from homogeneous to image coordinates
+        points_2d = points_proj[:, :2] / points_proj[:, 2:]
+        return points_2d
 
     def generate_frame(self, camera_index):
+        """Generate a frame for the specified camera."""
         frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
         
-        if camera_index == 0:
-            points = self.pattern_points
-        else:
-            points_homog = np.column_stack([self.pattern_points, np.ones(len(self.pattern_points))])
-            transformed_points = (self.view2_matrix @ points_homog.T).T
-            points = transformed_points[:, :2]
+        # Choose camera parameters based on index
+        R = self.R1 if camera_index == 0 else self.R2
+        t = self.t1 if camera_index == 0 else self.t2
+        
+        # Project 3D points to 2D
+        points_2d = self.project_points(self.world_points, R, t)
         
         # Draw points
-        for i, (x, y) in enumerate(points.astype(int)):
+        for i, (x, y) in enumerate(points_2d.astype(int)):
             if 0 <= x < self.width and 0 <= y < self.height:
                 cv2.circle(frame, (int(x), int(y)), 4, (255, 255, 255), -1)
                 cv2.putText(frame, str(i), (int(x)+5, int(y)+5), 
@@ -58,10 +84,108 @@ class MockTwoCameras:
         frame = self.generate_frame(camera_index)
         return frame, 0
 
+    def get_camera_parameters(self):
+        """Return the true camera parameters."""
+        return {
+            'K': self.K,
+            'R1': self.R1,
+            't1': self.t1,
+            'R2': self.R2,
+            't2': self.t2
+        }
+    
 class TwoCameraCalibrator:
     def __init__(self):
         self.cameras = MockTwoCameras()
-        self.F = None  # Store fundamental matrix
+        self.F = None
+        self.K = self.cameras.K  # We assume known intrinsics for simplicity
+
+    def calibrate_pair(self, dots1, dots2):
+        print(f"\nCalibrating with detected points:")
+        print(f"Camera 1: {len(dots1)} points")
+        print(f"Camera 2: {len(dots2)} points")
+
+        if len(dots1) != len(dots2) or len(dots1) < 8:
+            print("Error: Need at least 8 corresponding points")
+            return None, None, None
+
+        # Convert points to float32
+        pts1 = np.float32(dots1)
+        pts2 = np.float32(dots2)
+
+        # Normalize coordinates properly using camera intrinsics
+        pts1_norm = cv2.undistortPoints(pts1.reshape(-1, 1, 2), self.K, None)
+        pts2_norm = cv2.undistortPoints(pts2.reshape(-1, 1, 2), self.K, None)
+        pts1_norm = pts1_norm.reshape(-1, 2)
+        pts2_norm = pts2_norm.reshape(-1, 2)
+
+        # Find essential matrix using normalized coordinates
+        E, mask = cv2.findEssentialMat(pts1_norm, pts2_norm, focal=1.0, pp=(0., 0.), 
+                                     method=cv2.RANSAC, prob=0.999, threshold=1e-3)
+
+        # Recover R and t from essential matrix
+        _, R, t, mask = cv2.recoverPose(E, pts1_norm, pts2_norm)
+
+        # Get fundamental matrix from essential matrix
+        self.F = np.linalg.inv(self.K.T) @ E @ np.linalg.inv(self.K)
+
+        return R, t, self.F
+
+    def analyze_transformations(self, dots1, dots2):
+        """Analyze and compare ground truth vs estimated camera transformations."""
+        # Get ground truth parameters
+        params = self.cameras.get_camera_parameters()
+        R_gt = params['R2']  # R2 is relative to R1 (identity)
+        t_gt = params['t2']  # t2 is relative to t1 (zero)
+
+        # Get estimated transformation
+        R_est, t_est, _ = self.calibrate_pair(dots1, dots2)
+        
+        # Extract rotation angles
+        from scipy.spatial.transform import Rotation
+        r_gt = Rotation.from_matrix(R_gt)
+        r_est = Rotation.from_matrix(R_est)
+        
+        angle_gt = r_gt.as_rotvec()
+        angle_est = r_est.as_rotvec()
+        
+        angle_gt_deg = np.degrees(np.linalg.norm(angle_gt))
+        angle_est_deg = np.degrees(np.linalg.norm(angle_est))
+        
+        axis_gt = angle_gt / np.linalg.norm(angle_gt)
+        axis_est = angle_est / np.linalg.norm(angle_est)
+
+        print("\nRotation Analysis:")
+        print(f"Ground Truth:")
+        print(f"- Angle: {angle_gt_deg:.2f} degrees")
+        print(f"- Rotation Matrix:\n{R_gt}")
+        print(f"- Rotation Axis: {axis_gt}")
+        
+        print(f"\nEstimated:")
+        print(f"- Angle: {angle_est_deg:.2f} degrees")
+        print(f"- Rotation Matrix:\n{R_est}")
+        print(f"- Rotation Axis: {axis_est}")
+        
+        # Scale estimated translation to match ground truth scale
+        scale = np.linalg.norm(t_gt) / np.linalg.norm(t_est)
+        t_est_scaled = t_est * scale
+        
+        print("\nTranslation Analysis:")
+        print(f"Ground Truth: {t_gt.flatten()}")
+        print(f"Estimated (scaled): {t_est_scaled.flatten()}")
+        
+        # Calculate errors
+        angle_error = np.abs(angle_gt_deg - angle_est_deg)
+        axis_error = np.arccos(np.clip(np.abs(np.dot(axis_gt, axis_est)), -1.0, 1.0))
+        translation_error = np.linalg.norm(t_gt - t_est_scaled)
+        
+        print("\nErrors:")
+        print(f"Rotation Angle Error: {angle_error:.2f} degrees")
+        print(f"Rotation Axis Error: {np.degrees(axis_error):.2f} degrees")
+        print(f"Translation Error (after scaling): {translation_error:.2f} units")
+
+        return R_est, t_est, R_gt, t_gt
+
 
     def detect_dots(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -160,131 +284,6 @@ class TwoCameraCalibrator:
         print("\nShowing epipolar lines. Press any key to continue...")
         cv2.waitKey(0)
         cv2.destroyAllWindows()
-
-    def calibrate_pair(self, dots1, dots2):
-        print(f"\nCalibrating with detected points:")
-        print(f"Camera 1: {len(dots1)} points")
-        print(f"Camera 2: {len(dots2)} points")
-
-        if len(dots1) != len(dots2) or len(dots1) < 8:
-            print("Error: Need at least 8 corresponding points")
-            return None, None, None
-
-        # Convert points to float32
-        pts1 = np.float32(dots1)
-        pts2 = np.float32(dots2)
-
-        # Normalize points to [-1, 1] range
-        height, width = self.cameras.height, self.cameras.width
-        pts1_norm = pts1.copy()
-        pts2_norm = pts2.copy()
-        
-        pts1_norm[:, 0] = (pts1[:, 0] - width/2) / (width/2)
-        pts2_norm[:, 0] = (pts2[:, 0] - width/2) / (width/2)
-        pts1_norm[:, 1] = (pts1[:, 1] - height/2) / (height/2)
-        pts2_norm[:, 1] = (pts2[:, 1] - height/2) / (height/2)
-
-        # Calculate fundamental matrix
-        F, mask = cv2.findFundamentalMat(pts1_norm, pts2_norm, cv2.FM_8POINT, 1e-8, 0.99)
-        print("\nFundamental Matrix:")
-        print(F)
-
-        # Recover rotation and translation
-        points1 = pts1_norm.reshape(-1, 1, 2)
-        points2 = pts2_norm.reshape(-1, 1, 2)
-        K = np.eye(3)  # Identity for normalized coordinates
-        retval, R, t, mask = cv2.recoverPose(F, points1, points2, K)
-
-        print("\nRecovered Rotation Matrix:")
-        print(R)
-        print("\nRecovered Translation Vector:")
-        print(t)
-
-        angle_rad = np.arccos((np.trace(R) - 1) / 2)
-        print(f"\nRecovered rotation angle: {np.degrees(angle_rad):.2f} degrees")
-        print(f"Expected rotation angle: 20.00 degrees")
-
-        # Store F for epipolar line visualization
-        self.F = F
-
-        return R, t, F
-
-    def analyze_transformations(self, dots1, dots2):
-        """Analyze and compare ground truth vs estimated camera transformations."""
-        # Ground truth transformation (from MockTwoCameras)
-        angle_gt = np.radians(20)  # 20 degrees
-        R_gt = np.array([
-            [np.cos(angle_gt), 0, -np.sin(angle_gt)],
-            [0, 1, 0],
-            [np.sin(angle_gt), 0, np.cos(angle_gt)]
-        ])
-        t_gt = np.array([-50, 0, 0]).reshape(3, 1)  # -50 pixels in X
-
-        # Get estimated transformation
-        pts1 = np.float32(dots1)
-        pts2 = np.float32(dots2)
-        
-        # Normalize points to [-1, 1] range
-        height, width = self.cameras.height, self.cameras.width
-        pts1_norm = pts1.copy()
-        pts2_norm = pts2.copy()
-        
-        pts1_norm[:, 0] = (pts1[:, 0] - width/2) / (width/2)
-        pts2_norm[:, 0] = (pts2[:, 0] - width/2) / (width/2)
-        pts1_norm[:, 1] = (pts1[:, 1] - height/2) / (height/2)
-        pts2_norm[:, 1] = (pts2[:, 1] - height/2) / (height/2)
-
-        # Calculate fundamental matrix and recover pose
-        F, mask = cv2.findFundamentalMat(pts1_norm, pts2_norm, cv2.FM_8POINT, 1e-8, 0.99)
-        points1 = pts1_norm.reshape(-1, 1, 2)
-        points2 = pts2_norm.reshape(-1, 1, 2)
-        K = np.eye(3)  # Identity for normalized coordinates
-        retval, R_est, t_est, mask = cv2.recoverPose(F, points1, points2, K)
-
-        # Compare rotations
-        angle_est_rad = np.arccos((np.trace(R_est) - 1) / 2)
-        angle_est_deg = np.degrees(angle_est_rad)
-        
-        # Extract rotation axes
-        from scipy.spatial.transform import Rotation
-        r_gt = Rotation.from_matrix(R_gt)
-        r_est = Rotation.from_matrix(R_est)
-        
-        axis_gt = r_gt.as_rotvec() / np.linalg.norm(r_gt.as_rotvec())
-        axis_est = r_est.as_rotvec() / np.linalg.norm(r_est.as_rotvec())
-
-        print("\nRotation Analysis:")
-        print(f"Ground Truth:")
-        print(f"- Angle: 20.00 degrees")
-        print(f"- Rotation Matrix:\n{R_gt}")
-        print(f"- Rotation Axis: {axis_gt}")
-        
-        print(f"\nEstimated:")
-        print(f"- Angle: {angle_est_deg:.2f} degrees")
-        print(f"- Rotation Matrix:\n{R_est}")
-        print(f"- Rotation Axis: {axis_est}")
-        
-        # Compare translations
-        # Normalize estimated translation to match scale
-        t_est_norm = t_est * 50 / np.abs(t_est[0])  # Scale to match ground truth X translation
-        
-        print("\nTranslation Analysis:")
-        print(f"Ground Truth: {t_gt.flatten()}")
-        print(f"Estimated (scaled): {t_est_norm.flatten()}")
-        
-        # Calculate errors
-        angle_error = np.abs(20 - angle_est_deg)
-        translation_error = np.linalg.norm(t_gt - t_est_norm)
-        axis_error = np.arccos(np.clip(np.dot(axis_gt, axis_est), -1.0, 1.0))
-        
-        print("\nErrors:")
-        print(f"Rotation Angle Error: {angle_error:.2f} degrees")
-        print(f"Rotation Axis Error: {np.degrees(axis_error):.2f} degrees")
-        print(f"Translation Error (after scaling): {translation_error:.2f} units")
-
-        return R_est, t_est, R_gt, t_gt
-
-
 
     def visualize_epipolar_geometry_3d(self, dots1, dots2, R, t):
         """

@@ -2,6 +2,8 @@ import numpy as np
 import cv2
 from dataclasses import dataclass
 from typing import List, Tuple
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 class MockTwoCameras:
     def __init__(self, fps=30, resolution=(640, 480)):
@@ -19,26 +21,16 @@ class MockTwoCameras:
             [380, 200],
             [150, 300],   # Bottom left region
             [200, 350],
-            [180, 380],
             [450, 250],   # Bottom right region
             [500, 300],
-            [480, 350],
-            [250, 180],   # Additional points scattered around
-            [420, 130],
-            [300, 400],
-            [520, 220],
-            [170, 250],
-            [440, 380],
-            [280, 150],
-            [330, 320],
-            [390, 280],
-            [220, 420]
+
+
         ], dtype=np.float32)
         
         # Define transformation for second camera view
         angle = np.radians(20)
         self.view2_matrix = np.array([
-            [np.cos(angle), 0, -50],
+            [np.cos(angle), 0, -10],
             [0, 1, 0],
             [0, 0, 1]
         ], dtype=np.float32)
@@ -292,6 +284,96 @@ class TwoCameraCalibrator:
 
         return R_est, t_est, R_gt, t_gt
 
+
+
+    def visualize_epipolar_geometry_3d(self, dots1, dots2, R, t):
+        """
+        Visualize epipolar geometry in 3D space, showing:
+        - Camera positions and orientations
+        - 3D points
+        - Epipolar lines
+        - Camera rays
+        """
+        fig = plt.figure(figsize=(12, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # Set up first camera at origin
+        C1 = np.array([0, 0, 0])
+        R1 = np.eye(3)
+        
+        # Set up second camera using R and t
+        C2 = t.flatten()
+        R2 = R
+        
+        # Plot camera positions
+        ax.scatter(*C1, color='blue', s=100, label='Camera 1')
+        ax.scatter(*C2, color='red', s=100, label='Camera 2')
+        
+        # Draw camera coordinate frames
+        length = 0.5
+        colors = ['r', 'g', 'b']
+        
+        # Camera 1 axes
+        for i in range(3):
+            axis = np.zeros((2, 3))
+            axis[1, i] = length
+            ax.plot(axis[:, 0], axis[:, 1], axis[:, 2], color=colors[i])
+            
+        # Camera 2 axes
+        for i in range(3):
+            axis = np.zeros((2, 3))
+            axis[1, i] = length
+            axis_rotated = (R2 @ axis.T).T + C2
+            ax.plot(axis_rotated[:, 0], axis_rotated[:, 1], axis_rotated[:, 2], 
+                   color=colors[i], linestyle='--')
+        
+        # Calculate and plot epipolar lines for a few sample points
+        for i in range(len(dots1)):
+            # Convert image points to normalized coordinates
+            x1 = (dots1[i][0] - self.cameras.width/2) / self.cameras.width
+            y1 = (dots1[i][1] - self.cameras.height/2) / self.cameras.height
+            x2 = (dots2[i][0] - self.cameras.width/2) / self.cameras.width
+            y2 = (dots2[i][1] - self.cameras.height/2) / self.cameras.height
+            
+            # Create rays from each camera
+            ray1 = np.array([x1, y1, 1.0])
+            ray2 = np.array([x2, y2, 1.0])
+            
+            # Transform ray2 to world coordinates
+            ray2_world = (R2 @ ray2) + t.flatten()
+            
+            # Plot rays
+            ax.plot([C1[0], ray1[0]], [C1[1], ray1[1]], [C1[2], ray1[2]], 
+                   'b-', alpha=0.3)
+            ax.plot([C2[0], ray2_world[0]], [C2[1], ray2_world[1]], 
+                   [C2[2], ray2_world[2]], 'r-', alpha=0.3)
+            
+            # Calculate and plot epipolar line (plane intersection)
+            points = []
+            for depth in np.linspace(0, 2, 20):
+                point1 = ray1 * depth
+                point2 = ray2_world * depth
+                points.append((point1 + point2) / 2)
+            
+            points = np.array(points)
+            ax.plot(points[:, 0], points[:, 1], points[:, 2], 'g-', alpha=0.5)
+        
+        # Set axis labels and title
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.set_title('3D Epipolar Geometry Visualization')
+        
+        # Set equal aspect ratio
+        ax.set_box_aspect([1, 1, 1])
+        
+        # Add legend
+        ax.legend()
+        
+        # Show plot
+        plt.show()
+
+
 def main():
     calibrator = TwoCameraCalibrator()
     
@@ -306,6 +388,9 @@ def main():
     if F is not None:
         print("\nShowing epipolar lines...")
         calibrator.show_epipolar_lines(dots1, dots2, F)
+        
+        print("\nShowing 3D epipolar geometry...")
+        calibrator.visualize_epipolar_geometry_3d(dots1, dots2, R_est, t_est)
 
 if __name__ == "__main__":
     main()

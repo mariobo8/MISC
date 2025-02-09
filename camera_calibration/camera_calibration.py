@@ -37,7 +37,7 @@ class MockTwoCameras:
         self.t1 = np.zeros((3, 1))
         
         # Camera 2 parameters (rotated and translated)
-        angle = np.radians(35)  # 55-degree rotation around Y axis
+        angle = np.radians(45)  # 55-degree rotation around Y axis
         self.R2 = np.array([
             [np.cos(angle), 0, -np.sin(angle)],
             [0, 1, 0],
@@ -315,109 +315,121 @@ class TwoCameraCalibrator:
 
     def visualize_epipolar_geometry_3d(self, dots1, dots2, R_est, t_est):
         """
-        Visualize epipolar geometry in 3D space, showing:
+        Visualize epipolar geometry in 3D space, showing both ground truth (grey dashed)
+        and estimated (solid colored) configurations overlaid:
         - Camera positions and orientations
         - 3D points as seen from both cameras
         - Camera rays
         """
         # Get ground truth parameters
         params = self.cameras.get_camera_parameters()
-        R_gt = params['R2']  # Ground truth rotation
-        t_gt = params['t2']  # Ground truth translation
+        R_gt = params['R2']
+        t_gt = params['t2']
         
-        # Print comparison for verification
-        print("\nRotation Matrix Comparison:")
-        print("Ground Truth R:\n", R_gt)
-        print("\nEstimated R:\n", R_est)
-        
-        # Use ground truth for visualization
-        R = R_gt
-        t = t_gt
         fig = plt.figure(figsize=(12, 8))
         ax = fig.add_subplot(111, projection='3d')
         
-        # Set up first camera at origin
+        # Camera 1 is always at origin
         C1 = np.array([0, 0, 0])
         
-        # Set up second camera using R and t
-        scale = 5.0  # Original translation was [5, 0, 0]
-        t_scaled = t * (scale / np.linalg.norm(t))
-        C2 = t_scaled.flatten()
-        R2 = R
-        
-        # Plot camera positions
+        # Plot camera 1 (common to both configurations)
         ax.scatter(*C1, color='blue', s=100, label='Camera 1')
-        ax.scatter(*C2, color='red', s=100, label='Camera 2')
         
-        # Draw camera coordinate frames
+        # Draw camera 1 coordinate frame (common)
         length = 1.0
         colors = ['r', 'g', 'b']
-        
-        # Camera 1 axes
         for i in range(3):
             axis = np.zeros((2, 3))
             axis[1, i] = length
             ax.plot(axis[:, 0], axis[:, 1], axis[:, 2], color=colors[i])
         
-        # Camera 2 axes
+        # Plot ground truth configuration (grey, dashed)
+        C2_gt = t_gt.flatten()
+        ax.scatter(*C2_gt, color='gray', s=100, label='Camera 2 (Ground Truth)')
+        
+        # Ground truth camera 2 axes
         for i in range(3):
             axis = np.zeros((2, 3))
             axis[1, i] = length
-            # Important: First rotate the axis, then translate
-            axis_rotated = (R2 @ axis.T).T + C2
+            axis_rotated = (R_gt @ axis.T).T + C2_gt
             ax.plot(axis_rotated[:, 0], axis_rotated[:, 1], axis_rotated[:, 2], 
-                color=colors[i], linestyle='--')
+                color='gray', linestyle='--')
         
-        # Get 3D points as seen from both cameras
-        points_3d_cam1 = []
-        points_3d_cam2 = []
-
-        points_3d = self.triangulate_points(dots1, dots2, R, t)
-        points_3d_cam1 = points_3d  # Points already in world coordinates
-        points_3d_cam2 = points_3d  # Same points, different color for visualization
-    
+        # Ground truth 3D points
+        points_3d_gt = self.triangulate_points(dots1, dots2, R_gt, t_gt)
+        ax.scatter(points_3d_gt[:, 0], points_3d_gt[:, 1], points_3d_gt[:, 2],
+                color='gray', s=50, alpha=0.5, label='3D Points (Ground Truth)')
         
-        ax.scatter(points_3d_cam1[:, 0], points_3d_cam1[:, 1], points_3d_cam1[:, 2], 
-                color='blue', s=50, alpha=0.5, label='Points from Camera 1')
-        ax.scatter(points_3d_cam2[:, 0], points_3d_cam2[:, 1], points_3d_cam2[:, 2], 
-                color='red', s=50, alpha=0.5, label='Points from Camera 2')
-        
-        # Plot camera rays
+        # Ground truth camera rays
         for i in range(len(dots1)):
-            # Camera 1 rays
-            ax.plot([C1[0], points_3d_cam1[i, 0]], 
-                    [C1[1], points_3d_cam1[i, 1]], 
-                    [C1[2], points_3d_cam1[i, 2]], 
-                    'b-', alpha=0.3)
-            
-            # Camera 2 rays
-            ax.plot([C2[0], points_3d_cam2[i, 0]],
-                    [C2[1], points_3d_cam2[i, 1]],
-                    [C2[2], points_3d_cam2[i, 2]],
-                    'r-', alpha=0.3)
+            ax.plot([C1[0], points_3d_gt[i, 0]], 
+                [C1[1], points_3d_gt[i, 1]], 
+                [C1[2], points_3d_gt[i, 2]], 
+                'gray', linestyle='--', alpha=0.3)
+            ax.plot([C2_gt[0], points_3d_gt[i, 0]],
+                [C2_gt[1], points_3d_gt[i, 1]],
+                [C2_gt[2], points_3d_gt[i, 2]],
+                'gray', linestyle='--', alpha=0.3)
         
-        # Set axis labels and title
+        # Plot estimated configuration (colored, solid)
+        # Scale estimated translation to match ground truth scale
+        scale = np.linalg.norm(t_gt) / np.linalg.norm(t_est)
+        t_est_scaled = t_est * scale
+        C2_est = t_est_scaled.flatten()
+        ax.scatter(*C2_est, color='red', s=100, label='Camera 2 (Estimated)')
+        
+        # Estimated camera 2 axes
+        for i in range(3):
+            axis = np.zeros((2, 3))
+            axis[1, i] = length
+            axis_rotated = (R_est @ axis.T).T + C2_est
+            ax.plot(axis_rotated[:, 0], axis_rotated[:, 1], axis_rotated[:, 2], 
+                color=colors[i], linestyle='-')
+        
+        # Estimated 3D points
+        points_3d_est = self.triangulate_points(dots1, dots2, R_est, t_est_scaled)
+        ax.scatter(points_3d_est[:, 0], points_3d_est[:, 1], points_3d_est[:, 2],
+                color='green', s=50, alpha=0.5, label='3D Points (Estimated)')
+        
+        # Estimated camera rays
+        for i in range(len(dots1)):
+            ax.plot([C1[0], points_3d_est[i, 0]], 
+                [C1[1], points_3d_est[i, 1]], 
+                [C1[2], points_3d_est[i, 2]], 
+                'b-', alpha=0.3)
+            ax.plot([C2_est[0], points_3d_est[i, 0]],
+                [C2_est[1], points_3d_est[i, 1]],
+                [C2_est[2], points_3d_est[i, 2]],
+                'r-', alpha=0.3)
+        
+        # Set axis properties
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         ax.set_zlabel('Z')
-        ax.set_title('3D Epipolar Geometry Visualization')
-        
-        # Set equal aspect ratio
+        ax.set_title('3D Epipolar Geometry Visualization\n(Ground Truth in Grey Dashed, Estimated in Color)')
         ax.set_box_aspect([1, 1, 1])
-        
-        # Set consistent axis limits
         ax.set_xlim([-2, 6])
         ax.set_ylim([-2, 2])
         ax.set_zlim([0, 10])
-        
-        # Add legend
         ax.legend()
-        
-        # Adjust view for better visualization
         ax.view_init(elev=20, azim=45)
         
-        # Show plot
+        plt.tight_layout()
         plt.show()
+        
+        # Calculate and display numerical differences
+        t_gt_normalized = t_gt / np.linalg.norm(t_gt)
+        t_est_normalized = t_est / np.linalg.norm(t_est)
+        
+        print("\nNumerical Comparison:")
+        print(f"Translation direction error (degrees): {np.arccos(np.clip(np.dot(t_gt_normalized.flatten(), t_est_normalized.flatten()), -1.0, 1.0)) * 180 / np.pi:.2f}")
+        
+        from scipy.spatial.transform import Rotation
+        r_gt = Rotation.from_matrix(R_gt)
+        r_est = Rotation.from_matrix(R_est)
+        relative_rot = r_gt.inv() * r_est
+        angle_error = relative_rot.magnitude() * 180 / np.pi
+        print(f"Rotation error (degrees): {angle_error:.2f}")
 
 def main():
     calibrator = TwoCameraCalibrator()

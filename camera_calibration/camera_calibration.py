@@ -313,21 +313,126 @@ class TwoCameraCalibrator:
         points_3d = points_4d[:3] / points_4d[3]
         return points_3d.T
 
-    def visualize_epipolar_geometry_3d(self, dots1, dots2, R_est, t_est):
+    def bundle_adjustment(self, dots1, dots2, R_init, t_init):
         """
-        Visualize epipolar geometry in 3D space, showing both ground truth (grey dashed)
-        and estimated (solid colored) configurations overlaid:
-        - Camera positions and orientations
-        - 3D points as seen from both cameras
-        - Camera rays
+        Bundle adjustment implementation focusing on maintaining the initial solution stability
         """
+        from scipy import optimize
+        from scipy.spatial.transform import Rotation
+
+        # Convert points to float32 and normalize using camera intrinsics
+        pts1_norm = cv2.undistortPoints(np.float32(dots1).reshape(-1, 1, 2), 
+                                    self.K, None).reshape(-1, 2)
+        pts2_norm = cv2.undistortPoints(np.float32(dots2).reshape(-1, 1, 2), 
+                                    self.K, None).reshape(-1, 2)
+        
+        # Get initial 3D points
+        points_3d_init = self.triangulate_points(dots1, dots2, R_init, t_init)
+        
+        # Get initial rotation vector
+        r_init = Rotation.from_matrix(R_init).as_rotvec()
+        
+        def project_points_norm(points_3d, rvec, tvec):
+            """Project 3D points to normalized image plane."""
+            R = Rotation.from_rotvec(rvec).as_matrix()
+            
+            # Camera 1 (Identity rotation, zero translation)
+            points_c1 = points_3d
+            points_norm1 = points_c1[:, :2] / points_c1[:, 2:]
+            
+            # Camera 2
+            points_c2 = (R @ points_3d.T).T + tvec
+            points_norm2 = points_c2[:, :2] / points_c2[:, 2:]
+            
+            return points_norm1, points_norm2
+
+        def compute_cost(params):
+            """Compute the total cost with various terms."""
+            # Extract parameters
+            rvec = params[:3]
+            tvec = params[3:6]
+            points_3d = params[6:].reshape(-1, 3)
+            
+            # Project points
+            proj1, proj2 = project_points_norm(points_3d, np.zeros(3), np.zeros(3))
+            proj1_2, proj2_2 = project_points_norm(points_3d, rvec, tvec)
+            
+            # Reprojection error
+            reproj_error = np.sum((pts1_norm - proj1)**2) + np.sum((pts2_norm - proj2_2)**2)
+            
+            # Regularization for rotation - penalize large deviations from initial rotation
+            R_init_vec = Rotation.from_matrix(R_init).as_rotvec()
+            rot_reg = 1.0 * np.sum((rvec - R_init_vec)**2)
+            
+            # Regularization for translation direction - penalize large deviations from initial direction
+            t_init_dir = t_init.flatten() / np.linalg.norm(t_init.flatten())
+            t_cur_dir = tvec / np.linalg.norm(tvec)
+            trans_reg = 1.0 * np.sum((t_cur_dir - t_init_dir)**2)
+            
+            # Distance regularization - keep points at reasonable distances
+            dist_reg = 0.1 * np.sum(np.maximum(0, np.linalg.norm(points_3d, axis=1) - 15)**2)
+            
+            # Depth regularization - ensure points are in front of both cameras
+            depth_reg = 1.0 * np.sum(np.maximum(0, -points_3d[:, 2])**2)
+            
+            total_cost = reproj_error + rot_reg + trans_reg + dist_reg + depth_reg
+            return total_cost
+        
+        # Initial parameters
+        initial_params = np.concatenate([
+            r_init,
+            t_init.flatten(),
+            points_3d_init.flatten()
+        ])
+        
+        # Run optimization
+        print("\nPerforming bundle adjustment with strong regularization...")
+        result = optimize.minimize(
+            compute_cost,
+            initial_params,
+            method='BFGS',
+            options={'maxiter': 100, 'disp': True}
+        )
+        
+        # Extract results
+        rvec_opt = result.x[:3]
+        tvec_opt = result.x[3:6]
+        points_3d_opt = result.x[6:].reshape(-1, 3)
+        
+        # Convert back to rotation matrix
+        R_opt = Rotation.from_rotvec(rvec_opt).as_matrix()
+        
+        # Scale translation to match initial scale
+        scale = np.linalg.norm(t_init) / np.linalg.norm(tvec_opt)
+        t_opt = tvec_opt * scale
+        
+        return R_opt, t_opt.reshape(3, 1), points_3d_opt
+
+    def visualize_epipolar_geometry_3d(self, dots1, dots2, R_est, t_est, wait_for_bundle=True):
+        """
+        Visualize epipolar geometry in 3D space with interactive key handling
+        """
+        class KeyHandler:
+            def __init__(self):
+                self.do_bundle = False
+                
+            def on_key(self, event):
+                if event.key == 'b':
+                    plt.close()
+                    self.do_bundle = True
+                elif event.key == 'q':
+                    plt.close()
+                    self.do_bundle = False
+
+        key_handler = KeyHandler()
+        fig = plt.figure(figsize=(12, 8))
+        fig.canvas.mpl_connect('key_press_event', key_handler.on_key)
+        ax = fig.add_subplot(111, projection='3d')
+        
         # Get ground truth parameters
         params = self.cameras.get_camera_parameters()
         R_gt = params['R2']
         t_gt = params['t2']
-        
-        fig = plt.figure(figsize=(12, 8))
-        ax = fig.add_subplot(111, projection='3d')
         
         # Camera 1 is always at origin
         C1 = np.array([0, 0, 0])
@@ -415,21 +520,15 @@ class TwoCameraCalibrator:
         ax.view_init(elev=20, azim=45)
         
         plt.tight_layout()
-        plt.show()
         
-        # Calculate and display numerical differences
-        t_gt_normalized = t_gt / np.linalg.norm(t_gt)
-        t_est_normalized = t_est / np.linalg.norm(t_est)
-        
-        print("\nNumerical Comparison:")
-        print(f"Translation direction error (degrees): {np.arccos(np.clip(np.dot(t_gt_normalized.flatten(), t_est_normalized.flatten()), -1.0, 1.0)) * 180 / np.pi:.2f}")
-        
-        from scipy.spatial.transform import Rotation
-        r_gt = Rotation.from_matrix(R_gt)
-        r_est = Rotation.from_matrix(R_est)
-        relative_rot = r_gt.inv() * r_est
-        angle_error = relative_rot.magnitude() * 180 / np.pi
-        print(f"Rotation error (degrees): {angle_error:.2f}")
+        if wait_for_bundle:
+            print("\nPress 'b' to perform bundle adjustment, 'q' to exit...")
+            plt.show()
+            return key_handler.do_bundle
+        else:
+            plt.show()
+            return False
+
 
 def main():
     calibrator = TwoCameraCalibrator()
@@ -437,17 +536,43 @@ def main():
     print("Displaying camera views. Press 'q' to continue to calibration...")
     dots1, dots2 = calibrator.show_camera_views()
     
-    print("\nPerforming calibration...")
+    print("\nPerforming initial calibration...")
     R, t, F = calibrator.calibrate_pair(dots1, dots2)
-
     R_est, t_est, R_gt, t_gt = calibrator.analyze_transformations(dots1, dots2)
     
     if F is not None:
         print("\nShowing epipolar lines...")
         calibrator.show_epipolar_lines(dots1, dots2, F)
         
-        print("\nShowing 3D epipolar geometry...")
-        calibrator.visualize_epipolar_geometry_3d(dots1, dots2, R_est, t_est)
+        while True:
+            print("\nShowing 3D epipolar geometry...")
+            do_bundle = calibrator.visualize_epipolar_geometry_3d(dots1, dots2, R_est, t_est)
+            
+            if do_bundle:
+                print("\nPerforming bundle adjustment...")
+                R_bundle, t_bundle, _ = calibrator.bundle_adjustment(dots1, dots2, R_est, t_est)
+                R_est, t_est = R_bundle, t_bundle  # Update the current estimates
+                
+                # Analyze final results
+                print("\nAnalyzing bundle adjustment results:")
+                params = calibrator.cameras.get_camera_parameters()
+                R_gt = params['R2']
+                t_gt = params['t2']
+                
+                from scipy.spatial.transform import Rotation
+                r_gt = Rotation.from_matrix(R_gt)
+                r_bundle = Rotation.from_matrix(R_bundle)
+                relative_rot = r_gt.inv() * r_bundle
+                angle_error = relative_rot.magnitude() * 180 / np.pi
+                
+                scale = np.linalg.norm(t_gt) / np.linalg.norm(t_bundle)
+                t_bundle_scaled = t_bundle * scale
+                translation_error = np.linalg.norm(t_gt - t_bundle_scaled)
+                
+                print(f"Final rotation error: {angle_error:.2f} degrees")
+                print(f"Final translation error: {translation_error:.2f} units")
+            else:
+                break
 
 if __name__ == "__main__":
     main()

@@ -26,9 +26,10 @@ class MockTwoCameras:
         ], dtype=np.float32)
 
         # Camera 1 parameters (at origin, looking along Z axis)
+        focal_length = self.width / (2 * np.tan(np.radians(30)))
         self.K = np.array([
-            [self.width/2, 0, self.width/2],
-            [0, self.height/2, self.height/2],
+            [focal_length, 0, self.width/2],
+            [0, focal_length, self.height/2],
             [0, 0, 1]
         ], dtype=np.float32)
         
@@ -36,14 +37,14 @@ class MockTwoCameras:
         self.t1 = np.zeros((3, 1))
         
         # Camera 2 parameters (rotated and translated)
-        angle = np.radians(30)  # 55-degree rotation around Y axis
+        angle = np.radians(35)  # 55-degree rotation around Y axis
         self.R2 = np.array([
             [np.cos(angle), 0, -np.sin(angle)],
             [0, 1, 0],
             [np.sin(angle), 0, np.cos(angle)]
         ], dtype=np.float32)
         
-        self.t2 = np.array([-1, 0, 0], dtype=np.float32).reshape(3, 1)  # Reduced translation
+        self.t2 = np.array([5, 0, 0], dtype=np.float32).reshape(3, 1)  # Reduced translation
 
     def project_points(self, points_3d, R, t):
         """Project 3D points onto camera image plane."""
@@ -285,23 +286,63 @@ class TwoCameraCalibrator:
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
-    def visualize_epipolar_geometry_3d(self, dots1, dots2, R, t):
+    def triangulate_points(self, dots1, dots2, R, t):
+        """Triangulate 3D points from corresponding image points."""
+        # Convert points to float32 and correct shape
+        pts1 = np.float32(dots1).reshape(-1, 1, 2)
+        pts2 = np.float32(dots2).reshape(-1, 1, 2)
+        
+        # Convert image points to normalized coordinates
+        pts1_norm = cv2.undistortPoints(pts1, self.K, None)
+        pts2_norm = cv2.undistortPoints(pts2, self.K, None)
+        
+        # Reshape to (N, 2)
+        pts1_norm = pts1_norm.reshape(-1, 2)
+        pts2_norm = pts2_norm.reshape(-1, 2)
+        
+        # Create projection matrices with correct scale
+        P1 = self.K @ np.hstack((np.eye(3), np.zeros((3, 1))))
+        P2 = self.K @ np.hstack((R, t))
+        
+        # Triangulate points
+        points_4d = cv2.triangulatePoints(P1, P2, 
+                                        pts1.reshape(-1, 2).T,  # Use original image points
+                                        pts2.reshape(-1, 2).T)
+        
+        # Convert from homogeneous coordinates
+        points_3d = points_4d[:3] / points_4d[3]
+        return points_3d.T
+
+    def visualize_epipolar_geometry_3d(self, dots1, dots2, R_est, t_est):
         """
         Visualize epipolar geometry in 3D space, showing:
         - Camera positions and orientations
-        - 3D points
-        - Epipolar lines
+        - 3D points as seen from both cameras
         - Camera rays
         """
+        # Get ground truth parameters
+        params = self.cameras.get_camera_parameters()
+        R_gt = params['R2']  # Ground truth rotation
+        t_gt = params['t2']  # Ground truth translation
+        
+        # Print comparison for verification
+        print("\nRotation Matrix Comparison:")
+        print("Ground Truth R:\n", R_gt)
+        print("\nEstimated R:\n", R_est)
+        
+        # Use ground truth for visualization
+        R = R_gt
+        t = t_gt
         fig = plt.figure(figsize=(12, 8))
         ax = fig.add_subplot(111, projection='3d')
         
         # Set up first camera at origin
         C1 = np.array([0, 0, 0])
-        R1 = np.eye(3)
         
         # Set up second camera using R and t
-        C2 = t.flatten()
+        scale = 5.0  # Original translation was [5, 0, 0]
+        t_scaled = t * (scale / np.linalg.norm(t))
+        C2 = t_scaled.flatten()
         R2 = R
         
         # Plot camera positions
@@ -309,7 +350,7 @@ class TwoCameraCalibrator:
         ax.scatter(*C2, color='red', s=100, label='Camera 2')
         
         # Draw camera coordinate frames
-        length = 0.5
+        length = 1.0
         colors = ['r', 'g', 'b']
         
         # Camera 1 axes
@@ -317,45 +358,43 @@ class TwoCameraCalibrator:
             axis = np.zeros((2, 3))
             axis[1, i] = length
             ax.plot(axis[:, 0], axis[:, 1], axis[:, 2], color=colors[i])
-            
+        
         # Camera 2 axes
         for i in range(3):
             axis = np.zeros((2, 3))
             axis[1, i] = length
+            # Important: First rotate the axis, then translate
             axis_rotated = (R2 @ axis.T).T + C2
             ax.plot(axis_rotated[:, 0], axis_rotated[:, 1], axis_rotated[:, 2], 
-                   color=colors[i], linestyle='--')
+                color=colors[i], linestyle='--')
         
-        # Calculate and plot epipolar lines for a few sample points
+        # Get 3D points as seen from both cameras
+        points_3d_cam1 = []
+        points_3d_cam2 = []
+
+        points_3d = self.triangulate_points(dots1, dots2, R, t)
+        points_3d_cam1 = points_3d  # Points already in world coordinates
+        points_3d_cam2 = points_3d  # Same points, different color for visualization
+    
+        
+        ax.scatter(points_3d_cam1[:, 0], points_3d_cam1[:, 1], points_3d_cam1[:, 2], 
+                color='blue', s=50, alpha=0.5, label='Points from Camera 1')
+        ax.scatter(points_3d_cam2[:, 0], points_3d_cam2[:, 1], points_3d_cam2[:, 2], 
+                color='red', s=50, alpha=0.5, label='Points from Camera 2')
+        
+        # Plot camera rays
         for i in range(len(dots1)):
-            # Convert image points to normalized coordinates
-            x1 = (dots1[i][0] - self.cameras.width/2) / self.cameras.width
-            y1 = (dots1[i][1] - self.cameras.height/2) / self.cameras.height
-            x2 = (dots2[i][0] - self.cameras.width/2) / self.cameras.width
-            y2 = (dots2[i][1] - self.cameras.height/2) / self.cameras.height
+            # Camera 1 rays
+            ax.plot([C1[0], points_3d_cam1[i, 0]], 
+                    [C1[1], points_3d_cam1[i, 1]], 
+                    [C1[2], points_3d_cam1[i, 2]], 
+                    'b-', alpha=0.3)
             
-            # Create rays from each camera
-            ray1 = np.array([x1, y1, 1.0])
-            ray2 = np.array([x2, y2, 1.0])
-            
-            # Transform ray2 to world coordinates
-            ray2_world = (R2 @ ray2) + t.flatten()
-            
-            # Plot rays
-            ax.plot([C1[0], ray1[0]], [C1[1], ray1[1]], [C1[2], ray1[2]], 
-                   'b-', alpha=0.3)
-            ax.plot([C2[0], ray2_world[0]], [C2[1], ray2_world[1]], 
-                   [C2[2], ray2_world[2]], 'r-', alpha=0.3)
-            
-            # Calculate and plot epipolar line (plane intersection)
-            points = []
-            for depth in np.linspace(0, 2, 20):
-                point1 = ray1 * depth
-                point2 = ray2_world * depth
-                points.append((point1 + point2) / 2)
-            
-            points = np.array(points)
-            ax.plot(points[:, 0], points[:, 1], points[:, 2], 'g-', alpha=0.5)
+            # Camera 2 rays
+            ax.plot([C2[0], points_3d_cam2[i, 0]],
+                    [C2[1], points_3d_cam2[i, 1]],
+                    [C2[2], points_3d_cam2[i, 2]],
+                    'r-', alpha=0.3)
         
         # Set axis labels and title
         ax.set_xlabel('X')
@@ -366,12 +405,19 @@ class TwoCameraCalibrator:
         # Set equal aspect ratio
         ax.set_box_aspect([1, 1, 1])
         
+        # Set consistent axis limits
+        ax.set_xlim([-2, 6])
+        ax.set_ylim([-2, 2])
+        ax.set_zlim([0, 10])
+        
         # Add legend
         ax.legend()
         
+        # Adjust view for better visualization
+        ax.view_init(elev=20, azim=45)
+        
         # Show plot
         plt.show()
-
 
 def main():
     calibrator = TwoCameraCalibrator()

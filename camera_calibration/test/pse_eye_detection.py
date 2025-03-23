@@ -6,6 +6,144 @@ import sys
 from scipy.spatial import distance
 import json
 
+def bundle_adjustment(pts1, pts2, K, R_init, t_init, points_3d_init):
+    """
+    Refine camera parameters and 3D points to minimize reprojection error.
+    
+    Args:
+        pts1: 2D points in the first image
+        pts2: 2D points in the second image
+        K: Camera intrinsic matrix
+        R_init: Initial rotation matrix of second camera
+        t_init: Initial translation vector of second camera
+        points_3d_init: Initial 3D point estimates
+        
+    Returns:
+        Refined camera parameters and 3D points
+    """
+    from scipy import optimize
+    from scipy.spatial.transform import Rotation
+    
+    print("\n=== PERFORMING BUNDLE ADJUSTMENT ===")
+    
+    # Convert points to the right format
+    pts1 = np.array(pts1, dtype=np.float64)
+    pts2 = np.array(pts2, dtype=np.float64)
+    points_3d = np.array(points_3d_init, dtype=np.float64)
+    
+    # Number of points
+    n_points = len(points_3d)
+    
+    # Initial camera parameters
+    # First camera is at origin with identity rotation
+    # Second camera has the given R and t
+    
+    # Convert rotation matrix to rotation vector for optimization
+    r_vec_init, _ = cv.Rodrigues(R_init)
+    r_vec_init = r_vec_init.flatten()
+    t_init = t_init.flatten()
+    
+    # We'll optimize:
+    # 1. Focal length (same for both cameras)
+    # 2. Rotation of second camera (3 parameters)
+    # 3. Translation of second camera (3 parameters)
+    # 4. 3D coordinates of each point (3*n_points parameters)
+    
+    # Initial parameters vector
+    initial_focal = K[0, 0]
+    params = np.hstack((
+        [initial_focal],           # Focal length
+        r_vec_init,                # Rotation vector of camera 2
+        t_init,                    # Translation of camera 2
+        points_3d.flatten()        # 3D points
+    ))
+    
+    # Define the residual function for optimization
+    def compute_residuals(params):
+        # Extract parameters
+        focal = params[0]
+        r_vec = params[1:4]
+        t_vec = params[4:7]
+        points_3d = params[7:].reshape(-1, 3)
+        
+        # Update camera matrix with optimized focal length
+        K_opt = K.copy()
+        K_opt[0, 0] = K_opt[1, 1] = focal
+        
+        # Convert rotation vector to matrix
+        R_opt, _ = cv.Rodrigues(r_vec)
+        
+        # Compute projection matrices
+        P1 = K_opt @ np.hstack((np.eye(3), np.zeros((3, 1))))
+        P2 = K_opt @ np.hstack((R_opt, t_vec.reshape(3, 1)))
+        
+        # Compute reprojection errors
+        errors = []
+        
+        for i, point_3d in enumerate(points_3d):
+            # Convert to homogeneous coordinates
+            X = np.append(point_3d, 1)
+            
+            # Project to image 1 (first camera)
+            x1_proj = P1 @ X
+            x1_proj = x1_proj[:2] / x1_proj[2]  # Normalize
+            error1 = pts1[i] - x1_proj
+            
+            # Project to image 2 (second camera)
+            x2_proj = P2 @ X
+            x2_proj = x2_proj[:2] / x2_proj[2]  # Normalize
+            error2 = pts2[i] - x2_proj
+            
+            # Add all errors to the residual vector
+            errors.extend(error1)
+            errors.extend(error2)
+            
+        return np.array(errors)
+    
+    # Print initial reprojection error
+    initial_error = np.sum(compute_residuals(params)**2)
+    print(f"Initial total squared reprojection error: {initial_error:.2f}")
+    
+    # Run the optimization
+    print("Optimizing camera parameters and 3D points...")
+    result = optimize.least_squares(
+        compute_residuals, 
+        params, 
+        method='trf',
+        ftol=1e-5,
+        xtol=1e-5,
+        verbose=0
+    )
+    
+    # Extract optimized parameters
+    opt_params = result.x
+    opt_focal = opt_params[0]
+    opt_r_vec = opt_params[1:4]
+    opt_t_vec = opt_params[4:7]
+    opt_points_3d = opt_params[7:].reshape(-1, 3)
+    
+    # Convert rotation vector back to matrix
+    opt_R, _ = cv.Rodrigues(opt_r_vec)
+    opt_t = opt_t_vec.reshape(3, 1)
+    
+    # Update camera matrix
+    opt_K = K.copy()
+    opt_K[0, 0] = opt_K[1, 1] = opt_focal
+    
+    # Print final reprojection error
+    final_error = np.sum(compute_residuals(opt_params)**2)
+    print(f"Final total squared reprojection error: {final_error:.2f}")
+    print(f"Improvement: {(initial_error - final_error) / initial_error * 100:.2f}%")
+    
+    # Print optimized parameters
+    print(f"\nOptimized focal length: {opt_focal:.2f} (initial: {initial_focal:.2f})")
+    print("\nOptimized camera 2 rotation:")
+    print(opt_R)
+    print("\nOptimized camera 2 translation:")
+    print(opt_t)
+    
+    return opt_K, opt_R, opt_t, opt_points_3d
+
 # Load calibration data from JSON file
 def load_calibration(json_path):
     try:
@@ -519,6 +657,18 @@ except Exception as e:
     print("- Inaccurate camera parameters")
     print("- Nearly coplanar point configuration")
     points_3d = np.array([[0, 0, 0]])  # Create dummy point for visualization
+
+# Perform bundle adjustment to refine camera parameters and 3D points
+opt_K, opt_R, opt_t, opt_points_3d = bundle_adjustment(
+    pts1_inliers, pts2_inliers, K, R, t, points_3d)
+
+# Update parameters with optimized values
+K = opt_K
+R = opt_R
+t = opt_t
+points_3d = opt_points_3d
+
+print("\nBundle adjustment complete!")
 
 # Plot 3D points and camera positions
 fig = plt.figure(figsize=(10, 8))
